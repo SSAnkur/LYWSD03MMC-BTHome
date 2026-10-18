@@ -1,4 +1,4 @@
-# LYWSD03MMC 2025 B1.5 (HW B1.1) BTHome v2 beacon + LCD + OTA
+# LYWSD03MMC 2025 B1.5 (pvvx B1.1) BTHome v2 beacon + LCD + OTA
 
 Port of the nRF52840/Zephyr SHT41 beacon to the Xiaomi LYWSD03MMC
 (Telink TLSR8251). Same behaviour:
@@ -72,7 +72,7 @@ ln -s /path/to/tc32 ../ATC_MiThermometer/SDK/tools/linux/tc32
 make
 ```
 
-Produces `lywsd03mmc_b15_bthome.bin` (with the Telink CRC appended).
+Produces `LYWSD03MMC-BTHome.bin` (with the Telink CRC appended).
 
 ## Flashing
 
