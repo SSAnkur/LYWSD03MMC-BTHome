@@ -7,23 +7,23 @@
  *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
  *
  * OTA itself (packet handling, CRC, flash writes, swapping the boot bank
- * and rebooting) is done by the Telink BLE library: otaWrite()/otaRead().
- * The new image is written to the bank that is not running (0x00000 or
- * 0x20000, 128 KiB each), so a failed transfer leaves the old firmware
- * bootable.
+ * and rebooting) is done by the OTA server of the official Telink BLE
+ * library (stack/ble/service/ota/ota_server.h, otaWrite()). It speaks the
+ * legacy Telink OTA protocol (CMD_OTA_START / data / CMD_OTA_END) used by
+ * TelinkOTA.html, plus the extended one. The new image is written to the
+ * bank that is not running (0x00000 or 0x20000, 128 KiB each; at most
+ * 124 KiB of firmware, the SDK default), so a failed transfer leaves the old
+ * firmware bootable.
  */
 #include "tl_common.h"
 #include "drivers.h"
 #include "stack/ble/ble.h"
-#include "stack/ble/service/ble_ll_ota.h"
-#include "vendor/common/blt_common.h"
 #include "app_config.h"
 #include "ble.h"
 #include "lcd.h"
 
-void bls_set_advertise_prepare(void *p);	/* in the library, no header */
-
-/* Peripheral Preferred Connection Parameters (not in this SDK's headers) */
+/* Peripheral Preferred Connection Parameters (not in the SDK headers;
+ * the SDK's ble_sample defines it locally too) */
 typedef struct {
 	u16 intervalMin;
 	u16 intervalMax;
@@ -45,9 +45,6 @@ RAM static u32 window_start;
 
 static void close_window(void);
 RAM static u8 conn_param_accepted;
-
-RAM static u8 mac_public[6];
-static u8 mac_random_static[6];
 
 /* Scan response: complete local name DEV_NAME */
 #define NAME_LEN	(sizeof(DEV_NAME) - 1)
@@ -74,6 +71,7 @@ enum {
 	OTA_PS_H,		/* Telink OTA */
 	OTA_CD_H,
 	OTA_DP_H,
+	OTA_CCC_H,
 	OTA_DESC_H,
 
 	ATT_END_H,
@@ -120,26 +118,20 @@ static const u8 service_change_cd[5] = {
 	U16_LO(GATT_UUID_SERVICE_CHANGE), U16_HI(GATT_UUID_SERVICE_CHANGE)
 };
 
-/* Telink OTA */
-static const u8 ota_service_uuid[16] = TELINK_OTA_UUID_SERVICE;
-static const u8 ota_data_uuid[16] = TELINK_SPP_DATA_OTA;
-static u8 ota_data;
+/* Telink OTA, laid out as in the SDK's ble_sample: the official OTA
+ * server answers on the data characteristic itself (result and version
+ * responses of the extended protocol), hence NOTIFY and the CCC. */
+static const u8 ota_service_uuid[16] = WRAPPING_BRACES(TELINK_OTA_UUID_SERVICE);
+static const u8 ota_data_uuid[16] = WRAPPING_BRACES(TELINK_SPP_DATA_OTA);
+RAM static u8 ota_data;
+RAM static u8 ota_ccc[2];
 static const u8 ota_name[] = { 'O', 'T', 'A' };
 static const u8 ota_cd[19] = {
-	CHAR_PROP_READ | CHAR_PROP_WRITE_WITHOUT_RSP,
+	CHAR_PROP_READ | CHAR_PROP_WRITE_WITHOUT_RSP | CHAR_PROP_NOTIFY |
+		CHAR_PROP_WRITE,
 	U16_LO(OTA_DP_H), U16_HI(OTA_DP_H),
-	0x12, 0x2B, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08,
-	0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00
+	TELINK_SPP_DATA_OTA
 };
-
-
-/* Make the library's OTA timeout an inactivity timeout (pvvx otaWritePre):
- * every OTA packet restarts it. */
-static int ota_write_pre(void *p)
-{
-	blt_ota_start_tick = clock_time() | 1;
-	return otaWrite(p);
-}
 
 /* In RAM, as pvvx: the stack walks this table from interrupt context,
  * which must not depend on flash reads while OTA is erasing/writing it. */
@@ -159,9 +151,10 @@ RAM static attribute_t attributes[] = {
 	{ 0, ATT_PERMISSIONS_READ, 2, sizeof(service_change_val), (u8 *)&service_change_uuid, (u8 *)&service_change_val, 0, 0 },
 	{ 0, ATT_PERMISSIONS_RDWR, 2, sizeof(service_change_ccc), (u8 *)&ccc_uuid, (u8 *)&service_change_ccc, 0, 0 },
 
-	{ 4, ATT_PERMISSIONS_READ, 2, 16, (u8 *)&primary_service_uuid, (u8 *)ota_service_uuid, 0, 0 },
+	{ 5, ATT_PERMISSIONS_READ, 2, 16, (u8 *)&primary_service_uuid, (u8 *)ota_service_uuid, 0, 0 },
 	{ 0, ATT_PERMISSIONS_READ, 2, sizeof(ota_cd), (u8 *)&character_uuid, (u8 *)ota_cd, 0, 0 },
-	{ 0, ATT_PERMISSIONS_RDWR, 16, sizeof(ota_data), (u8 *)ota_data_uuid, &ota_data, &ota_write_pre, &otaRead },
+	{ 0, ATT_PERMISSIONS_RDWR, 16, sizeof(ota_data), (u8 *)ota_data_uuid, &ota_data, &otaWrite, 0 },
+	{ 0, ATT_PERMISSIONS_RDWR, 2, sizeof(ota_ccc), (u8 *)&ccc_uuid, ota_ccc, 0, 0 },
 	{ 0, ATT_PERMISSIONS_READ, 2, sizeof(ota_name), (u8 *)&user_desc_uuid, (u8 *)ota_name, 0, 0 },
 
 };
@@ -174,7 +167,6 @@ static void ota_start_cb(void)
 	ota_active = 1;
 	conn_param_accepted = 0;
 	bls_pm_setManualLatency(0);
-	bls_ota_setTimeout(OTA_IDLE_TIMEOUT_US);
 }
 
 /* After a successful OTA the library reboots into the new image itself;
@@ -233,12 +225,17 @@ static void suspend_exit_cb(u8 e, u8 *p, int n)
 void ble_init(const u8 *adv, int adv_len, int (*adv_prepare)(void *),
 	      int open_window)
 {
-	/* Factory public address (A4:C1:38:...) from the stock flash layout */
-	blc_initMacAddress(CFG_ADR_MAC, mac_public, mac_random_static);
+	u8 mac_public[6];
+	u8 mac_random_static[6];
+
+	/* Factory public address (A4:C1:38:...) from the stock flash layout:
+	 * flash_sector_mac_address = 0x76000 on the 512 KiB flash */
+	blc_initMacAddress(flash_sector_mac_address, mac_public,
+			   mac_random_static);
 
 	memcpy(&scan_rsp[2], DEV_NAME, NAME_LEN);
 	scan_rsp[0] = NAME_LEN + 1;
-	scan_rsp[1] = GAP_ADTYPE_LOCAL_NAME_COMPLETE;
+	scan_rsp[1] = DT_COMPLETE_LOCAL_NAME;
 
 	/* Controller */
 	blc_ll_initStandby_module(mac_public);
@@ -246,22 +243,25 @@ void ble_init(const u8 *adv, int adv_len, int (*adv_prepare)(void *),
 	blc_ll_initConnection_module();
 	blc_ll_initSlaveRole_module();
 
-	/* Host */
+	/* Host (GAP first, as the SDK requires) */
 	blc_gap_peripheral_init();
-	bls_att_setAttributeTable((u8 *)attributes);
 	blc_l2cap_register_handler(blc_l2cap_packet_receive);
+	bls_att_setAttributeTable((u8 *)attributes);
 	blc_smp_setSecurityLevel(No_Security);
+
+	/* OTA server. Its init also erases the inactive bank if it still
+	 * holds an old image. */
+	blc_ota_initOtaServer_module();
+	blc_ota_setOtaProcessTimeout(OTA_PROCESS_TIMEOUT_S);
+	blc_ota_setOtaDataPacketTimeout(OTA_PACKET_TIMEOUT_S);
+	blc_ota_registerOtaStartCmdCb(ota_start_cb);
+	blc_ota_registerOtaResultIndicationCb(ota_result_cb);
 
 	rf_set_power_level_index(RF_TX_POWER);
 	bls_app_registerEventCallback(BLT_EV_FLAG_CONNECT, &connect_cb);
 	bls_app_registerEventCallback(BLT_EV_FLAG_TERMINATE, &disconnect_cb);
 	bls_app_registerEventCallback(BLT_EV_FLAG_SUSPEND_EXIT, &suspend_exit_cb);
 	blc_l2cap_registerConnUpdateRspCb(conn_param_rsp_cb);
-
-	/* OTA: erase the inactive bank if it still holds an old image */
-	bls_ota_clearNewFwDataArea();
-	bls_ota_registerStartCmdCb(ota_start_cb);
-	bls_ota_registerResultIndicateCb(ota_result_cb);
 
 	/* Advertising */
 	bls_ll_setAdvData((u8 *)adv, adv_len);
@@ -281,19 +281,18 @@ void ble_init(const u8 *adv, int adv_len, int (*adv_prepare)(void *),
 		close_window();
 	}
 
-	/* Power management (pvvx init_ble) */
+	/* Power management. Thresholds as pvvx init_ble; early wake-up and
+	 * retention size as the SDK's ble_sample: 16 KiB retention when code
+	 * + retained data fit, else 32 KiB. */
 	blc_ll_initPowerManagement_module();
+	blc_app_setDeepsleepRetentionSramSize();
 	blc_pm_setDeepsleepRetentionThreshold(40, 18);
-	blc_pm_setDeepsleepRetentionEarlyWakeupTiming(240);
-	blc_pm_setDeepsleepRetentionType(DEEPSLEEP_MODE_RET_SRAM_LOW32K);
+	blc_pm_setDeepsleepRetentionEarlyWakeupTiming(270);
 	bls_pm_setSuspendMask(SUSPEND_ADV | DEEPSLEEP_RETENTION_ADV |
 			      SUSPEND_CONN | DEEPSLEEP_RETENTION_CONN);
 	bls_pm_setManualLatency(0);
 }
 
-/* Called every main-loop pass. During OTA: answer every connection event
- * (no slave latency) and never use deep-sleep retention, which would drop
- * the transfer state. Otherwise allow the deepest sleep everywhere. */
 /* Window over: non-connectable advertising at the normal interval. In
  * this mode the radio does not listen after each packet. */
 static void close_window(void)
@@ -306,6 +305,9 @@ static void close_window(void)
 	lcd_show_ble(0);
 }
 
+/* Called every main-loop pass. During OTA: answer every connection event
+ * (no slave latency) and never use deep-sleep retention, which would drop
+ * the transfer state. Otherwise allow the deepest sleep everywhere. */
 _attribute_ram_code_
 int ble_task(void)
 {
@@ -336,5 +338,6 @@ void ble_init_deep_retention(void)
 {
 	rf_set_power_level_index(RF_TX_POWER);
 	blc_ll_recoverDeepRetention();
-	bls_ota_registerStartCmdCb(ota_start_cb);	/* as pvvx */
+	/* OTA server state and callbacks live in retention RAM in the
+	 * official library: nothing to re-register */
 }

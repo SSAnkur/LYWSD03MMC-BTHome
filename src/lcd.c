@@ -25,7 +25,6 @@
  */
 #include "tl_common.h"
 #include "drivers.h"
-#include "drivers/8258/gpio_8258.h"
 #include "app_config.h"
 #include "lcd.h"
 

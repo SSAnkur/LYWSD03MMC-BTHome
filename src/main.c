@@ -1,6 +1,7 @@
 /*
  * BTHome v2 temperature / humidity beacon with LCD and OTA - Xiaomi
- * LYWSD03MMC B1.5 (Telink TLSR8251, Telink BLE SDK, no RTOS)
+ * LYWSD03MMC B1.5 (Telink TLSR8251, official Telink tc_ble_single_sdk,
+ * no RTOS)
  *
  * Every 60 s: measure T/RH (SHTV3) and VDD, update the segment LCD and the
  * BTHome v2 advertisement sent every 10 s. For OTA_WINDOW_S after the
@@ -21,7 +22,6 @@
 #include "tl_common.h"
 #include "drivers.h"
 #include "stack/ble/ble.h"
-#include "vendor/common/blt_common.h"
 #include "app_config.h"
 #include "sensor.h"
 #include "battery.h"
@@ -90,6 +90,22 @@ static void low_battery(u16 mv)
 	sensor_sleep();
 	lcd_show_low_battery(mv);
 	deep_sleep_s(LOW_VBAT_SLEEP_S);
+}
+
+/* The OTA server writes flash: clear block protection left by other
+ * firmware, once per power-on, as pvvx does. Same operation as the pvvx
+ * SDK's flash_unlock() (status register := 0), done with the official
+ * driver, but only when a protection bit is actually set. Works on any
+ * SPI flash, unlike the per-chip flash_prot.c, which only knows the
+ * flash types listed in the SDK. */
+#define FLASH_SR_PROTECT_BITS	0xFC	/* BP0..BP4, SRP0 */
+
+static void flash_clear_write_protection(void)
+{
+	if (flash_read_status(FLASH_READ_STATUS_CMD_LOWBYTE) &
+	    FLASH_SR_PROTECT_BITS) {
+		flash_write_status(FLASH_TYPE_8BIT_STATUS, 0);
+	}
 }
 
 _attribute_ram_code_
@@ -173,6 +189,16 @@ static int adv_prepare_cb(void *p)
 
 static void user_init_normal(void)
 {
+	/* Must come before any BLE stack initialisation (official order) */
+	random_generator_init();
+
+	/* Flash size -> sector map (MAC 0x76000, calibration 0x77000 on the
+	 * 512 KiB part), then the factory calibration from that sector:
+	 * crystal trim, flash supply and ADC reference. Read-only, so it is
+	 * safe before the battery check, which needs the ADC calibration. */
+	blc_readFlashSize_autoConfigCustomFlashSector();
+	blc_app_loadCustomizedParameters_normal();
+
 	blc_ll_initBasicMCU();
 	adc_power_on_sar_adc(0);
 	lpc_power_down();
@@ -194,10 +220,7 @@ static void user_init_normal(void)
 		low_battery(vbat_mv);
 	}
 
-	/* The library writes flash for OTA: clear write protection left by
-	 * other firmware (as pvvx, once per power-on) */
-	flash_unlock();
-	random_generator_init();
+	flash_clear_write_protection();
 
 #if ADV_NAME_IN_ADV
 	memcpy(&adv[18], DEV_NAME, NAME_LEN);
@@ -217,11 +240,10 @@ static void user_init_normal(void)
 	}
 	publish();
 
-	/* DEEP_ANA_REG0 survives deep sleep and software reboots and is
-	 * cleared only by a power cycle (pvvx uses it the same way) */
-	int power_on = analog_read(DEEP_ANA_REG0) != 0x55;
+	/* Cleared only by a power cycle, see app_config.h */
+	int power_on = analog_read(POWER_ON_FLAG_REG) != POWER_ON_FLAG;
 
-	analog_write(DEEP_ANA_REG0, 0x55);
+	analog_write(POWER_ON_FLAG_REG, POWER_ON_FLAG);
 
 	bls_pm_registerAppWakeupLowPowerCb(measure_done_cb);
 	ble_init(adv, sizeof(adv), adv_prepare_cb, power_on);
@@ -231,6 +253,7 @@ static void user_init_normal(void)
 _attribute_ram_code_
 static void user_init_deepRetn(void)
 {
+	blc_app_loadCustomizedParameters_deepRetn();	/* crystal trim, VDD_F */
 	blc_ll_initBasicMCU();
 	ble_init_deep_retention();
 }
@@ -280,11 +303,11 @@ int main(void)
 
 	int deep_ret = pm_is_MCU_deepRetentionWakeup();
 
+	/* Same order as the SDK's ble_sample */
+	rf_drv_ble_init();
 	gpio_init(!deep_ret);
 	clock_init(SYS_CLK_TYPE);
-	rf_drv_init(RF_MODE_BLE_1M);
 	reg_clk_en0 = FLD_CLK0_SWIRE_EN;	/* gate unused peripheral clocks */
-	blc_app_loadCustomizedParameters();	/* factory crystal trim */
 
 	if (deep_ret) {
 		user_init_deepRetn();

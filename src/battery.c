@@ -3,7 +3,9 @@
  * kept driven high (= VDD) permanently by gpio_init() (see app_config.h,
  * same as pvvx) and sampled through the 1/8 prescaler against the
  * 1.2 V reference. 8 samples are taken, sorted, and the middle 4 averaged.
- * ADC sequence follows pvvx/ATC_MiThermometer battery.c.
+ * ADC sequence follows pvvx/ATC_MiThermometer battery.c; the conversion
+ * uses the per-chip reference calibration of the official SDK (as its
+ * adc_sample_and_get_result() does) unless ADC_VREF_MV fixes it.
  */
 #include "tl_common.h"
 #include "drivers.h"
@@ -11,6 +13,11 @@
 #include "battery.h"
 
 #define ADC_SAMPLES	8
+
+/* Set by user_calib_adc_vref() from blc_app_loadCustomizedParameters_normal()
+ * (drivers/B85/adc.c, retention RAM, default 1175 mV / 0 mV) */
+extern unsigned short adc_gpio_calib_vref;
+extern signed char adc_gpio_calib_vref_offset;
 
 /* ADC analog config is not kept across deep-sleep retention: set it up each time */
 static void vbat_adc_setup(void)
@@ -61,8 +68,16 @@ u16 battery_read_mv(void)
 	dfifo_disable_dfifo2();
 	adc_power_on_sar_adc(0);
 
-	/* mV = avg/8192 * Vref * 8 = sum4 * Vref / 4096 */
+	/* mV = avg/8192 * Vref * 8 + offset = sum4 * Vref / 4096 + offset */
 	u32 sum = s[2] + s[3] + s[4] + s[5];
 
+	if (!sum) {
+		return 0;
+	}
+#if ADC_VREF_MV
 	return (u16)((sum * ADC_VREF_MV + 2048) >> 12);
+#else
+	return (u16)((s32)((sum * adc_gpio_calib_vref + 2048) >> 12) +
+		     adc_gpio_calib_vref_offset);
+#endif
 }
